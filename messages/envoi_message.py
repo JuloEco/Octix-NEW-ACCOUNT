@@ -51,7 +51,7 @@ def envoyer_email_confirmation(destinataire: str, username: str) -> None:
         msg.get_payload()[1].add_related(f.read(), maintype="image", subtype="png", cid="<octix_logo.png>")
 
     # Intégration du GIF de validation
-    with open(BASE_DIR / "tick-dark.gif", "rb") as f:
+    with open(BASE_DIR / "tick-dark-octix.gif", "rb") as f:
         msg.get_payload()[1].add_related(f.read(), maintype="image", subtype="gif", cid="<tick_dark_icon>")
 
     with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
