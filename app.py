@@ -20,7 +20,7 @@ import time
 import secrets
 import requests
 from flask import Flask, render_template_string, request, flash, url_for
-from envoi_message import envoyer_email_confirmation, envoyer_code_reinitialisation
+from messages.envoi_message import envoyer_email_confirmation, envoyer_code_reinitialisation
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "octix_portal_secret")
