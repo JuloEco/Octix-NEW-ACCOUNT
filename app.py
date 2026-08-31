@@ -1,703 +1,337 @@
 """
-Octix Portal — le SEUL endroit où un compte Octix peut être créé.
-====================================================================
-Toutes les apps de l'écosystème (Opsiom, Omnia, Axiom...) redirigent ici
-pour la création de compte. Elles ne font plus que du login contre l'API
-Octix (octix.py) — jamais de /register en local.
+Octix — service d'authentification centralisé
+================================================
+Un point d'entrée unique pour créer des comptes, se connecter,
+et VÉRIFIER un token depuis n'importe quelle autre app (LearnCode, classroom, etc.)
+
+Version adaptée pour Vercel : utilise une vraie base Postgres (Vercel Postgres,
+Neon, Supabase...) au lieu de SQLite, car le système de fichiers de Vercel est
+en lecture seule (sauf /tmp, qui n'est PAS persistant entre deux invocations
+de la fonction serverless). Avec SQLite sur /tmp, chaque cold start repartirait
+d'une base vide : les comptes créés disparaîtraient.
 
 Installation :
-    pip install flask requests --break-system-packages
+    pip install flask flask_sqlalchemy pyjwt psycopg2-binary --break-system-packages
 
-Lancement :
-    python app.py
-    -> portail disponible sur http://localhost:5051
-    (nécessite que octix.py tourne sur http://localhost:5050, ou définis
-     OCTIX_URL si l'API est ailleurs)
+Lancement en local (avec Postgres) :
+    export POSTGRES_URL="postgresql://user:password@host:5432/dbname"
+    export OCTIX_SECRET_KEY="une-vraie-cle-secrete"
+    export OCTIX_INTERNAL_KEY="une-cle-partagee-avec-le-portail"
+    python octix.py
+    -> service disponible sur http://localhost:5050
+
+Déploiement sur Vercel :
+    1. Ajoute l'intégration "Vercel Postgres" (ou Neon/Supabase) à ton projet
+       -> Vercel injecte automatiquement POSTGRES_URL / POSTGRES_URL_NON_POOLING
+    2. Définis OCTIX_SECRET_KEY et OCTIX_INTERNAL_KEY dans les variables d'environnement
+    3. Si la table "user" existe déjà (déploiement pré-existant), lance
+       migrate_add_email.py UNE FOIS avant de déployer cette version : db.create_all()
+       ne modifie jamais une table déjà créée, il ne crée que les tables manquantes.
+    4. Déploie via `vercel` (voir vercel.json + api/index.py)
+
+Endpoints publics (utilisés par les apps clientes) :
+    POST /register   {username, password, email, classroom_role}   -> 201 / 409
+    POST /login       {username, password}          -> {token, username, expires_in_hours, missing_fields}
+    GET|POST /verify   {token}                       -> {valid: true, username} ou {valid: false, error}
+    POST /complete-profile   {email?, classroom_role?}   (Authorization: Bearer <token>)
+        -> comble les champs manquants sur un compte créé avant leur ajout,
+           sans jamais toucher au mot de passe (voir missing_fields ci-dessus)
+
+Endpoints internes (utilisés uniquement par le portail Octix, jamais par un
+navigateur — protégés par le header X-Internal-Key si OCTIX_INTERNAL_KEY est défini) :
+    GET  /user/<username>/email      -> {email} ou 404
+    POST /reset-password  {username, new_password}   -> {ok: true} ou 404
 """
 
 import os
-import time
-import secrets
-import requests
-from flask import Flask, render_template_string, request, flash, url_for
-from envoi_message import envoyer_email_confirmation, envoyer_code_reinitialisation
+import datetime
+import jwt
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "octix_portal_secret")
-
-OCTIX_URL = os.environ.get("OCTIX_URL", "http://localhost:5050")
-OCTIX_INTERNAL_KEY = os.environ.get("OCTIX_INTERNAL_KEY")
 
 
-def _internal_headers():
-    """Header attendu par octix.py sur /user/<username>/email et
-    /reset-password. Doit être la même valeur des deux côtés."""
-    return {"X-Internal-Key": OCTIX_INTERNAL_KEY} if OCTIX_INTERNAL_KEY else {}
-
-APPS = [
-    {"key": "opsiom", "name": "Opsiom", "tagline": "Recherche IA", "file": "opsiom.png"},
-    {"key": "omnia", "name": "Omnia", "tagline": "Apprentissage du code", "file": "omnia.png"},
-    {"key": "axiom", "name": "Axiom", "tagline": "Jeux vidéo", "file": "axiom.png"},
-]
+def _normalize_db_url(url: str) -> str:
+    """Vercel Postgres / Heroku-style fournissent souvent 'postgres://',
+    or SQLAlchemy 1.4+ exige le préfixe 'postgresql://'."""
+    if url and url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return url
 
 
-def octix_register(username, password, email):
-    try:
-        r = requests.post(
-            f"{OCTIX_URL}/register",
-            json={"username": username, "password": password, "email": email},
-            timeout=5,
-        )
-        if r.status_code == 201:
-            return True, None
-        return False, r.json().get("error", "Erreur inconnue lors de la création du compte.")
-    except requests.exceptions.RequestException:
-        return False, "Octix est injoignable pour le moment. Réessaie dans un instant."
+# Ordre de priorité des variables d'environnement :
+# - POSTGRES_URL_NON_POOLING : connexion directe (sans pgbouncer), utile pour
+#   les opérations de schéma (create_all, migrations)
+# - POSTGRES_URL : connexion "pooled" fournie automatiquement par l'intégration
+#   Vercel Postgres, à utiliser pour les requêtes normales de l'app
+# - DATABASE_URL : fallback générique si tu utilises Neon/Supabase directement
+# - sqlite en mémoire : UNIQUEMENT pour tourner le code sans base configurée
+#   (tests rapides) — ne jamais utiliser en prod sur Vercel
+db_uri = (
+    os.environ.get("POSTGRES_URL")
+    or os.environ.get("DATABASE_URL")
+    or os.environ.get("POSTGRES_URL_NON_POOLING")
+    or "sqlite:///:memory:"
+)
+app.config["SQLALCHEMY_DATABASE_URI"] = _normalize_db_url(db_uri)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    # essentiel en environnement serverless : évite d'utiliser une connexion
+    # que la base a déjà fermée de son côté entre deux invocations
+    "pool_pre_ping": True,
+    # recycle la connexion avant que le Postgres managé ne la coupe lui-même
+    "pool_recycle": 280,
+}
+
+SECRET_KEY = os.environ.get("OCTIX_SECRET_KEY", "change-moi-en-production")
+TOKEN_DURATION_HOURS = 12
+
+# Clé partagée avec le portail pour protéger les endpoints internes
+# (/user/<username>/email et /reset-password). Si non définie, ces routes
+# restent ouvertes (pratique en dev local) mais un avertissement est loggé :
+# à définir obligatoirement avant tout déploiement public.
+INTERNAL_KEY = os.environ.get("OCTIX_INTERNAL_KEY")
+
+db = SQLAlchemy(app)
 
 
-def octix_get_email(username):
-    """Récupère l'e-mail associé à un pseudo. Nécessite un endpoint côté
-    octix.py (voir CONTRAT_OCTIX_API.md). Retourne None si le compte
-    n'existe pas ou si l'API est injoignable."""
-    try:
-        r = requests.get(f"{OCTIX_URL}/user/{username}/email", headers=_internal_headers(), timeout=5)
-        if r.status_code == 200:
-            return r.json().get("email")
-        return None
-    except requests.exceptions.RequestException:
-        return None
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(255), unique=True, nullable=True)
+    classroom_role = db.Column(db.String(20), nullable=True)  # 'prof' ou 'eleve'
+    password_hash = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
 
 
-def octix_reset_password(username, new_password):
-    """Écrase le mot de passe d'un compte existant. Nécessite un endpoint
-    côté octix.py (voir CONTRAT_OCTIX_API.md)."""
-    try:
-        r = requests.post(
-            f"{OCTIX_URL}/reset-password",
-            json={"username": username, "new_password": new_password},
-            headers=_internal_headers(),
-            timeout=5,
-        )
-        if r.status_code == 200:
-            return True, None
-        return False, r.json().get("error", "Erreur inconnue lors de la réinitialisation.")
-    except requests.exceptions.RequestException:
-        return False, "Octix est injoignable pour le moment. Réessaie dans un instant."
+REQUIRED_PROFILE_FIELDS = ("email", "classroom_role")
 
 
-# --- Codes de réinitialisation en mémoire (à remplacer par un stockage
-#     persistant type Redis/DB si le portail tourne sur plusieurs workers,
-#     sinon un redémarrage ou un second worker perd les codes en cours). ---
-RESET_CODES = {}
-CODE_DUREE_VALIDITE = 10 * 60  # 10 minutes
-TENTATIVES_MAX = 5
+def missing_profile_fields(user):
+    """Champs manquants sur un compte — typiquement des comptes créés avant
+    l'ajout de ces colonnes. Le mot de passe n'apparaît jamais ici : il est
+    obligatoire depuis la toute première version du formulaire, donc jamais
+    manquant."""
+    missing = []
+    if not user.email:
+        missing.append("email")
+    if not user.classroom_role:
+        missing.append("classroom_role")
+    return missing
 
 
-def generer_code():
-    return f"{secrets.randbelow(1_000_000):06d}"
-
-
-PAGE = """
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Octix — crée ton identifiant</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --bg:#060b12;
-    --surface:#0d1620;
-    --surface-2:#101b28;
-    --border:#1c2c3d;
-    --border-soft:#152233;
-    --primary:#0f7ba3;
-    --accent:#4fc3de;
-    --text:#eaf3f7;
-    --text-muted:#7d95a8;
-    --danger:#e5636b;
-  }
-  *{box-sizing:border-box;}
-  body{
-    margin:0;
-    min-height:100vh;
-    background:
-      radial-gradient(circle at 50% -10%, rgba(15,123,163,0.28), transparent 55%),
-      var(--bg);
-    color:var(--text);
-    font-family:'Inter', sans-serif;
-    display:flex;
-    flex-direction:column;
-    align-items:center;
-    padding:64px 20px 40px;
-  }
-  .eyebrow{
-    font-family:'JetBrains Mono', monospace;
-    font-size:12px;
-    letter-spacing:0.18em;
-    text-transform:uppercase;
-    color:var(--accent);
-    margin:0 0 18px;
-  }
-  .logo-wrap{
-    position:relative;
-    width:120px;
-    height:120px;
-    margin-bottom:8px;
-  }
-  .logo-wrap::before{
-    content:"";
-    position:absolute;
-    inset:-40px;
-    background:radial-gradient(circle, rgba(79,195,222,0.35), transparent 65%);
-    filter:blur(6px);
-    z-index:0;
-  }
-  .logo-wrap img{
-    position:relative;
-    z-index:1;
-    width:100%;
-    height:100%;
-    object-fit:contain;
-  }
-  h1{
-    font-family:'Space Grotesk', sans-serif;
-    font-weight:600;
-    font-size:2.1rem;
-    letter-spacing:-0.01em;
-    text-align:center;
-    margin:6px 0 10px;
-  }
-  .subtitle{
-    color:var(--text-muted);
-    text-align:center;
-    max-width:420px;
-    line-height:1.55;
-    margin:0 0 40px;
-    font-size:0.95rem;
-  }
-  .subtitle b{color:var(--text); font-weight:600;}
-  .card{
-    width:100%;
-    max-width:380px;
-    background:var(--surface);
-    border:1px solid var(--border);
-    border-radius:16px;
-    padding:32px;
-  }
-  .field{
-    display:flex;
-    flex-direction:column;
-    gap:6px;
-    margin-bottom:16px;
-  }
-  .field label{
-    font-size:12px;
-    font-family:'JetBrains Mono', monospace;
-    color:var(--text-muted);
-    letter-spacing:0.04em;
-  }
-  .field input{
-    background:var(--surface-2);
-    border:1px solid var(--border);
-    border-radius:9px;
-    padding:12px 14px;
-    color:var(--text);
-    font-size:0.95rem;
-    font-family:'Inter', sans-serif;
-    outline:none;
-    transition:border-color .15s ease;
-  }
-  .field input:focus{border-color:var(--accent);}
-  .hint{font-size:12px; color:var(--text-muted); margin-top:-10px; margin-bottom:16px;}
-  .hint a{color:var(--accent); text-decoration:underline;}
-  .error-box{
-    background:rgba(229,99,107,0.1);
-    border:1px solid rgba(229,99,107,0.35);
-    color:#f3a1a6;
-    border-radius:9px;
-    padding:11px 14px;
-    font-size:0.85rem;
-    margin-bottom:18px;
-  }
-  button{
-    width:100%;
-    padding:13px;
-    border:none;
-    border-radius:9px;
-    background:linear-gradient(135deg, var(--primary), var(--accent));
-    color:#04141c;
-    font-weight:600;
-    font-size:0.95rem;
-    font-family:'Inter', sans-serif;
-    cursor:pointer;
-    transition:opacity .15s ease;
-  }
-  button:hover{opacity:0.9;}
-  .success{
-    text-align:center;
-    padding:6px 0 4px;
-  }
-  .success .check{
-    width:48px;
-    height:48px;
-    border-radius:50%;
-    background:rgba(79,195,222,0.15);
-    border:1px solid rgba(79,195,222,0.4);
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    margin:0 auto 18px;
-    font-size:22px;
-    color:var(--accent);
-  }
-  .success h2{
-    font-family:'Space Grotesk', sans-serif;
-    font-size:1.3rem;
-    margin:0 0 10px;
-  }
-  .success p{
-    color:var(--text-muted);
-    font-size:0.9rem;
-    line-height:1.6;
-    margin:0;
-  }
-  .success p b{color:var(--text);}
-
-  .connected{
-    margin-top:56px;
-    width:100%;
-    max-width:520px;
-    text-align:center;
-  }
-  .connected .label{
-    font-family:'JetBrains Mono', monospace;
-    font-size:11px;
-    letter-spacing:0.14em;
-    text-transform:uppercase;
-    color:var(--text-muted);
-    margin-bottom:22px;
-  }
-  .threads{
-    position:relative;
-    height:34px;
-    max-width:340px;
-    margin:0 auto;
-  }
-  .apps-row{
-    display:flex;
-    justify-content:center;
-    gap:28px;
-    flex-wrap:wrap;
-  }
-  .app-badge{
-    display:flex;
-    flex-direction:column;
-    align-items:center;
-    width:104px;
-  }
-  .app-badge .icon{
-    width:56px;
-    height:56px;
-    border-radius:14px;
-    background:var(--surface);
-    border:1px solid var(--border);
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    margin-bottom:10px;
-  }
-  .app-badge .icon img{width:38px; height:38px; object-fit:contain;}
-  .app-badge .name{font-size:0.85rem; font-weight:500;}
-  .app-badge .tagline{font-size:0.72rem; color:var(--text-muted); margin-top:2px;}
-
-  footer{
-    margin-top:48px;
-    font-size:0.78rem;
-    color:var(--text-muted);
-    text-align:center;
-    max-width:380px;
-    line-height:1.6;
-  }
-</style>
-</head>
-<body>
-
-  <p class="eyebrow">Identité Axiom</p>
-  <div class="logo-wrap">
-    <img src="{{ url_for('static', filename='logos/octix.png') }}" alt="Octix">
-  </div>
-  <h1>Un compte. Toutes les apps.</h1>
-  <p class="subtitle">Octix est l'identifiant unique de l'écosystème Axiom. <b>Crée-le une seule fois ici</b> : il fonctionnera directement sur Opsiom, Omnia et Axiom, avec le même pseudo et le même mot de passe.</p>
-
-  <div class="card">
-    {% if success %}
-      <div class="success">
-        <div class="check">&#10003;</div>
-        <h2>Compte créé</h2>
-        <p>Ton identifiant <b>{{ username }}</b> est prêt. Retourne sur Opsiom, Omnia ou Axiom et connecte-toi avec ce pseudo et ce mot de passe. Un e-mail de confirmation vient de t'être envoyé.</p>
-      </div>
-    {% else %}
-      {% with messages = get_flashed_messages() %}
-        {% if messages %}
-          <div class="error-box">{{ messages[0] }}</div>
-        {% endif %}
-      {% endwith %}
-      <form method="post" id="octix-register-form">
-        <div class="field">
-          <label for="username">Pseudo</label>
-          <input type="text" id="username" name="username" placeholder="Choisis un pseudo" required>
-        </div>
-        <div class="field">
-          <label for="email">E-mail</label>
-          <input type="email" id="email" name="email" placeholder="ton@email.com" required>
-        </div>
-        <p class="hint"><a href="{{ url_for('why_email') }}" target="_blank">Pourquoi on te le demande ?</a></p>
-        <div class="field">
-          <label for="password">Mot de passe</label>
-          <input type="password" id="password" name="password" placeholder="6 caractères minimum" required minlength="6">
-        </div>
-        <div class="field" style="margin-bottom:6px;">
-          <label for="password2">Confirme le mot de passe</label>
-          <input type="password" id="password2" name="password2" placeholder="Retape le même mot de passe" required minlength="6">
-        </div>
-        <p class="hint">Ce mot de passe sera le même partout : Opsiom, Omnia, Axiom.</p>
-        <button type="submit">Créer mon compte Octix</button>
-      </form>
-    {% endif %}
-  </div>
-
-  <div class="connected">
-    <p class="label">Fonctionne avec</p>
-    <div class="apps-row">
-      {% for a in apps %}
-        <div class="app-badge">
-          <div class="icon"><img src="{{ url_for('static', filename='logos/' + a.file) }}" alt="{{ a.name }}"></div>
-          <div class="name">{{ a.name }}</div>
-          <div class="tagline">{{ a.tagline }}</div>
-        </div>
-      {% endfor %}
-    </div>
-  </div>
-
-  <footer>Un seul identifiant Octix pour toute la famille d'apps Axiom. Ton mot de passe n'est jamais stocké en clair. <a href="{{ url_for('mot_de_passe_oublie') }}" style="color:var(--accent);">Mot de passe oublié ?</a></footer>
-
-<script>
-  const form = document.getElementById('octix-register-form');
-  if (form) {
-    form.addEventListener('submit', function(e){
-      const p1 = document.getElementById('password').value;
-      const p2 = document.getElementById('password2').value;
-      if (p1 !== p2) {
-        e.preventDefault();
-        alert("Les deux mots de passe ne correspondent pas.");
-      }
-    });
-  }
-</script>
-</body>
-</html>
-"""
-
-
-@app.route("/", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        email = request.form.get("email", "").strip()
-        password = request.form.get("password", "")
-        password2 = request.form.get("password2", "")
-
-        if not username or not email or not password:
-            flash("Merci de remplir le pseudo, l'e-mail et le mot de passe.")
-            return render_template_string(PAGE, success=False, apps=APPS)
-
-        if "@" not in email or "." not in email.split("@")[-1]:
-            flash("Cet e-mail ne semble pas valide.")
-            return render_template_string(PAGE, success=False, apps=APPS)
-
-        if password != password2:
-            flash("Les deux mots de passe ne correspondent pas.")
-            return render_template_string(PAGE, success=False, apps=APPS)
-
-        ok, error = octix_register(username, password, email)
-        if not ok:
-            flash(error)
-            return render_template_string(PAGE, success=False, apps=APPS)
-
-        # L'e-mail de bienvenue ne doit jamais faire échouer la création du
-        # compte : si Gmail est indisponible, on log et on continue quand même.
-        try:
-            envoyer_email_confirmation(email, username)
-        except Exception as e:
-            app.logger.warning(f"Échec de l'envoi de l'e-mail de confirmation à {email} : {e}")
-
-        return render_template_string(PAGE, success=True, username=username, apps=APPS)
-
-    return render_template_string(PAGE, success=False, apps=APPS)
-
-
-WHY_EMAIL_PAGE = """
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Pourquoi on te demande ton e-mail — Octix</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --bg:#060b12; --surface:#0d1620; --border:#1c2c3d;
-    --primary:#0f7ba3; --accent:#4fc3de; --text:#eaf3f7; --text-muted:#7d95a8;
-  }
-  *{box-sizing:border-box;}
-  body{
-    margin:0; min-height:100vh;
-    background: radial-gradient(circle at 50% -10%, rgba(15,123,163,0.28), transparent 55%), var(--bg);
-    color:var(--text); font-family:'Inter', sans-serif;
-    display:flex; justify-content:center; padding:64px 20px;
-  }
-  .wrap{max-width:520px;}
-  .eyebrow{
-    font-family:'JetBrains Mono', monospace; font-size:12px; letter-spacing:0.18em;
-    text-transform:uppercase; color:var(--accent); margin:0 0 14px;
-  }
-  h1{font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:1.8rem; margin:0 0 22px;}
-  p{color:var(--text-muted); line-height:1.7; font-size:0.95rem; margin:0 0 18px;}
-  p b{color:var(--text); font-weight:600;}
-  .card{background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:28px 30px; margin-bottom:24px;}
-  .back{display:inline-block; color:var(--accent); text-decoration:none; font-size:0.9rem; margin-top:8px;}
-  .back:hover{text-decoration:underline;}
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <p class="eyebrow">Confidentialité</p>
-    <h1>Pourquoi on te demande ton e-mail</h1>
-    <div class="card">
-      <p>Ton compte Octix ouvre les portes d'Opsiom, Omnia et Axiom — et cet écosystème continue de bouger : nouvelles fonctionnalités, mises à jour, parfois des changements qui touchent directement ton compte. L'e-mail est le seul canal qui nous permet de te prévenir même quand tu n'es pas en train d'utiliser une des apps.</p>
-      <p><b>Ce que ça veut dire concrètement :</b> tu reçois un e-mail à la création de ton compte pour confirmer que tout est en ordre, et éventuellement un message ponctuel si quelque chose d'important change (sécurité, nouvelle app qui rejoint l'écosystème, etc.).</p>
-      <p><b>Ce que ça ne veut pas dire :</b> pas de newsletter, pas de sollicitations marketing, pas de partage avec qui que ce soit en dehors d'Octix. Ton e-mail sert uniquement à te joindre au sujet de ton propre compte.</p>
-    </div>
-    <a class="back" href="{{ url_for('register') }}">&larr; Retour à la création de compte</a>
-  </div>
-</body>
-</html>
-"""
-
-
-@app.route("/pourquoi-email")
-def why_email():
-    return render_template_string(WHY_EMAIL_PAGE)
-
-
-FORGOT_PAGE = """
-<!DOCTYPE html>
-<html lang="fr">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Mot de passe oublié — Octix</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-  :root{
-    --bg:#060b12; --surface:#0d1620; --surface-2:#101b28; --border:#1c2c3d;
-    --primary:#0f7ba3; --accent:#4fc3de; --text:#eaf3f7; --text-muted:#7d95a8; --danger:#e5636b;
-  }
-  *{box-sizing:border-box;}
-  body{
-    margin:0; min-height:100vh;
-    background: radial-gradient(circle at 50% -10%, rgba(15,123,163,0.28), transparent 55%), var(--bg);
-    color:var(--text); font-family:'Inter', sans-serif;
-    display:flex; flex-direction:column; align-items:center; padding:64px 20px 40px;
-  }
-  .eyebrow{
-    font-family:'JetBrains Mono', monospace; font-size:12px; letter-spacing:0.18em;
-    text-transform:uppercase; color:var(--accent); margin:0 0 18px;
-  }
-  h1{font-family:'Space Grotesk', sans-serif; font-weight:600; font-size:1.9rem; text-align:center; margin:0 0 10px;}
-  .subtitle{color:var(--text-muted); text-align:center; max-width:400px; line-height:1.55; margin:0 0 32px; font-size:0.92rem;}
-  .card{width:100%; max-width:380px; background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:32px;}
-  .field{display:flex; flex-direction:column; gap:6px; margin-bottom:16px;}
-  .field label{font-size:12px; font-family:'JetBrains Mono', monospace; color:var(--text-muted); letter-spacing:0.04em;}
-  .field input{
-    background:var(--surface-2); border:1px solid var(--border); border-radius:9px;
-    padding:12px 14px; color:var(--text); font-size:0.95rem; font-family:'Inter', sans-serif;
-    outline:none; transition:border-color .15s ease;
-  }
-  .field input:focus{border-color:var(--accent);}
-  .code-input{
-    text-align:center; font-family:'JetBrains Mono', monospace;
-    font-size:1.4rem; letter-spacing:0.5em; padding-left:0.5em;
-  }
-  .hint{font-size:12px; color:var(--text-muted); margin-top:-10px; margin-bottom:16px;}
-  .error-box{
-    background:rgba(229,99,107,0.1); border:1px solid rgba(229,99,107,0.35); color:#f3a1a6;
-    border-radius:9px; padding:11px 14px; font-size:0.85rem; margin-bottom:18px;
-  }
-  button{
-    width:100%; padding:13px; border:none; border-radius:9px;
-    background:linear-gradient(135deg, var(--primary), var(--accent));
-    color:#04141c; font-weight:600; font-size:0.95rem; font-family:'Inter', sans-serif;
-    cursor:pointer; transition:opacity .15s ease;
-  }
-  button:hover{opacity:0.9;}
-  .success{text-align:center; padding:6px 0 4px;}
-  .success .check{
-    width:48px; height:48px; border-radius:50%; background:rgba(79,195,222,0.15);
-    border:1px solid rgba(79,195,222,0.4); display:flex; align-items:center; justify-content:center;
-    margin:0 auto 18px; font-size:22px; color:var(--accent);
-  }
-  .success h2{font-family:'Space Grotesk', sans-serif; font-size:1.3rem; margin:0 0 10px;}
-  .success p{color:var(--text-muted); font-size:0.9rem; line-height:1.6; margin:0;}
-  .back{display:inline-block; color:var(--accent); text-decoration:none; font-size:0.85rem; margin-top:24px;}
-  .back:hover{text-decoration:underline;}
-</style>
-</head>
-<body>
-  <p class="eyebrow">Identité Axiom</p>
-
-  {% if step == 'request' %}
-    <h1>Mot de passe oublié</h1>
-    <p class="subtitle">Indique ton pseudo Octix : si le compte existe, on envoie un code à 6 chiffres à l'e-mail associé.</p>
-    <div class="card">
-      {% with messages = get_flashed_messages() %}
-        {% if messages %}<div class="error-box">{{ messages[0] }}</div>{% endif %}
-      {% endwith %}
-      <form method="post" action="{{ url_for('mot_de_passe_oublie') }}">
-        <div class="field">
-          <label for="username">Pseudo</label>
-          <input type="text" id="username" name="username" placeholder="Ton pseudo Octix" required>
-        </div>
-        <button type="submit">Envoyer le code</button>
-      </form>
-    </div>
-  {% elif step == 'verify' %}
-    <h1>Entre le code reçu</h1>
-    <p class="subtitle">Un code à 6 chiffres vient d'être envoyé à l'e-mail associé à <b>{{ username }}</b>. Il expire dans 10 minutes.</p>
-    <div class="card">
-      {% with messages = get_flashed_messages() %}
-        {% if messages %}<div class="error-box">{{ messages[0] }}</div>{% endif %}
-      {% endwith %}
-      <form method="post" action="{{ url_for('reinitialiser_mot_de_passe') }}" id="reset-form">
-        <input type="hidden" name="username" value="{{ username }}">
-        <div class="field">
-          <label for="code">Code reçu par e-mail</label>
-          <input type="text" id="code" name="code" class="code-input" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required>
-        </div>
-        <div class="field">
-          <label for="password">Nouveau mot de passe</label>
-          <input type="password" id="password" name="password" placeholder="6 caractères minimum" required minlength="6">
-        </div>
-        <div class="field" style="margin-bottom:6px;">
-          <label for="password2">Confirme le nouveau mot de passe</label>
-          <input type="password" id="password2" name="password2" placeholder="Retape le même mot de passe" required minlength="6">
-        </div>
-        <p class="hint">Ce mot de passe remplacera l'ancien sur Opsiom, Omnia et Axiom.</p>
-        <button type="submit">Réinitialiser mon mot de passe</button>
-      </form>
-    </div>
-  {% else %}
-    <h1>Terminé</h1>
-    <div class="card">
-      <div class="success">
-        <div class="check">&#10003;</div>
-        <h2>Mot de passe mis à jour</h2>
-        <p>Ton nouveau mot de passe est actif dès maintenant sur Opsiom, Omnia et Axiom.</p>
-      </div>
-    </div>
-  {% endif %}
-
-  <a class="back" href="{{ url_for('register') }}">&larr; Retour à l'accueil</a>
-
-{% if step == 'verify' %}
-<script>
-  const form = document.getElementById('reset-form');
-  form.addEventListener('submit', function(e){
-    const p1 = document.getElementById('password').value;
-    const p2 = document.getElementById('password2').value;
-    if (p1 !== p2) {
-      e.preventDefault();
-      alert("Les deux mots de passe ne correspondent pas.");
+def generate_token(username):
+    payload = {
+        "sub": username,
+        "iat": datetime.datetime.utcnow(),
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=TOKEN_DURATION_HOURS),
+        "iss": "octix",
     }
-  });
-</script>
-{% endif %}
-</body>
-</html>
-"""
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
 
-@app.route("/mot-de-passe-oublie", methods=["GET", "POST"])
-def mot_de_passe_oublie():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        if not username:
-            flash("Merci d'indiquer un pseudo.")
-            return render_template_string(FORGOT_PAGE, step="request")
-
-        email = octix_get_email(username)
-        if email:
-            code = generer_code()
-            RESET_CODES[username] = {
-                "code": code,
-                "expires_at": time.time() + CODE_DUREE_VALIDITE,
-                "attempts": 0,
-            }
-            try:
-                envoyer_code_reinitialisation(email, username, code)
-            except Exception as e:
-                app.logger.warning(f"Échec de l'envoi du code de réinitialisation à {email} : {e}")
-        # On affiche le même écran que le compte existe ou non, pour ne pas
-        # révéler quels pseudos sont enregistrés (protection contre l'énumération).
-        return render_template_string(FORGOT_PAGE, step="verify", username=username)
-
-    return render_template_string(FORGOT_PAGE, step="request")
+def decode_token(token):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        return payload, None
+    except jwt.ExpiredSignatureError:
+        return None, "token expiré"
+    except jwt.InvalidTokenError:
+        return None, "token invalide"
 
 
-@app.route("/reinitialiser-mot-de-passe", methods=["POST"])
-def reinitialiser_mot_de_passe():
-    username = request.form.get("username", "").strip()
-    code = request.form.get("code", "").strip()
-    password = request.form.get("password", "")
-    password2 = request.form.get("password2", "")
-
-    entry = RESET_CODES.get(username)
-
-    if password != password2:
-        flash("Les deux mots de passe ne correspondent pas.")
-        return render_template_string(FORGOT_PAGE, step="verify", username=username)
-
-    if not entry:
-        flash("Ce code a expiré ou n'existe plus. Redemande un code.")
-        return render_template_string(FORGOT_PAGE, step="request")
-
-    if time.time() > entry["expires_at"]:
-        del RESET_CODES[username]
-        flash("Ce code a expiré. Redemande-en un nouveau.")
-        return render_template_string(FORGOT_PAGE, step="request")
-
-    if entry["attempts"] >= TENTATIVES_MAX:
-        del RESET_CODES[username]
-        flash("Trop de tentatives. Redemande un nouveau code.")
-        return render_template_string(FORGOT_PAGE, step="request")
-
-    if code != entry["code"]:
-        entry["attempts"] += 1
-        flash("Code incorrect.")
-        return render_template_string(FORGOT_PAGE, step="verify", username=username)
-
-    ok, error = octix_reset_password(username, password)
-    del RESET_CODES[username]  # le code ne doit servir qu'une fois, succès ou non
-    if not ok:
-        flash(error)
-        return render_template_string(FORGOT_PAGE, step="request")
-
-    return render_template_string(FORGOT_PAGE, step="done")
+def _internal_auth_ok(req) -> bool:
+    """True si l'appelant a le droit d'utiliser un endpoint interne.
+    Ces routes ne doivent jamais être exposées à un navigateur : seul le
+    portail (le seul autre service à parler à octix.py) doit connaître
+    OCTIX_INTERNAL_KEY."""
+    if not INTERNAL_KEY:
+        app.logger.warning("OCTIX_INTERNAL_KEY non défini : endpoints internes non protégés.")
+        return True
+    return req.headers.get("X-Internal-Key") == INTERNAL_KEY
 
 
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json(silent=True, force=True) or request.form
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    email = (data.get("email") or "").strip()
+    classroom_role = (data.get("classroom_role") or "").strip().lower()
+
+    if not username or not password or not email or not classroom_role:
+        return jsonify({"error": "username, password, email et classroom_role requis"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "mot de passe trop court (6 caractères minimum)"}), 400
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"error": "e-mail invalide"}), 400
+    if classroom_role not in ("prof", "eleve"):
+        return jsonify({"error": "classroom_role doit être 'prof' ou 'eleve'"}), 400
+    if User.query.filter_by(username=username).first():
+        return jsonify({"error": "ce pseudo existe déjà"}), 409
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "cet e-mail est déjà associé à un compte"}), 409
+
+    user = User(username=username, email=email, classroom_role=classroom_role)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "compte créé", "username": username}), 201
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True, force=True) or request.form
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.check_password(password):
+        return jsonify({"error": "identifiants invalides"}), 401
+
+    token = generate_token(user.username)
+    return jsonify({
+        "token": token,
+        "username": user.username,
+        "expires_in_hours": TOKEN_DURATION_HOURS,
+        # Permet à n'importe quelle app cliente (Classroom, LearnCode...) de
+        # savoir si elle doit afficher le pop-up "informations manquantes"
+        # -- typique des comptes créés avant l'ajout de ces champs.
+        "missing_fields": missing_profile_fields(user),
+    })
+
+
+@app.route("/verify", methods=["GET", "POST"])
+def verify():
+    token = (
+        request.args.get("token")
+        or (request.get_json(silent=True, force=True) or {}).get("token")
+        or request.form.get("token")
+    )
+    if not token:
+        return jsonify({"valid": False, "error": "token manquant"}), 400
+
+    payload, error = decode_token(token)
+    if error:
+        return jsonify({"valid": False, "error": error}), 401
+
+    return jsonify({"valid": True, "username": payload["sub"]})
+
+
+@app.route("/user/<username>/email", methods=["GET"])
+def get_user_email(username):
+    """Interne — utilisé par le portail pour savoir où envoyer le code de
+    réinitialisation. Ne jamais exposer ça à un formulaire public."""
+    if not _internal_auth_ok(request):
+        return jsonify({"error": "non autorisé"}), 403
+
+    user = User.query.filter_by(username=username).first()
+    if not user or not user.email:
+        return jsonify({"error": "compte introuvable"}), 404
+
+    return jsonify({"email": user.email})
+
+
+@app.route("/reset-password", methods=["POST"])
+def reset_password():
+    """Interne — appelé par le portail une fois le code à 6 chiffres validé.
+    Volontairement sans vérification de l'ancien mot de passe : le code déjà
+    vérifié côté portail fait office de preuve d'identité."""
+    if not _internal_auth_ok(request):
+        return jsonify({"error": "non autorisé"}), 403
+
+    data = request.get_json(silent=True, force=True) or request.form
+    username = (data.get("username") or "").strip()
+    new_password = data.get("new_password") or ""
+
+    if not username or not new_password:
+        return jsonify({"error": "username et new_password requis"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "mot de passe trop court (6 caractères minimum)"}), 400
+
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        return jsonify({"error": "compte introuvable"}), 404
+
+    user.set_password(new_password)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/complete-profile", methods=["POST"])
+def complete_profile():
+    """Appelé par le pop-up 'informations manquantes' de n'importe quelle app
+    (Classroom, LearnCode...) une fois l'utilisateur connecté. Authentifié
+    par le token JWT obtenu au login -- pas besoin de redemander le mot de
+    passe. Ne met à jour QUE les champs fournis, jamais le reste du profil."""
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else None
+    if not token:
+        return jsonify({"error": "authentification requise (Authorization: Bearer <token>)"}), 401
+
+    payload, error = decode_token(token)
+    if error:
+        return jsonify({"error": error}), 401
+
+    user = User.query.filter_by(username=payload["sub"]).first()
+    if not user:
+        return jsonify({"error": "compte introuvable"}), 404
+
+    data = request.get_json(silent=True, force=True) or request.form
+    updated = []
+
+    if data.get("email"):
+        email = data["email"].strip()
+        if "@" not in email or "." not in email.split("@")[-1]:
+            return jsonify({"error": "e-mail invalide"}), 400
+        existing = User.query.filter_by(email=email).first()
+        if existing and existing.id != user.id:
+            return jsonify({"error": "cet e-mail est déjà associé à un compte"}), 409
+        user.email = email
+        updated.append("email")
+
+    if data.get("classroom_role"):
+        role = data["classroom_role"].strip().lower()
+        if role not in ("prof", "eleve"):
+            return jsonify({"error": "classroom_role doit être 'prof' ou 'eleve'"}), 400
+        user.classroom_role = role
+        updated.append("classroom_role")
+
+    if not updated:
+        return jsonify({"error": "aucun champ valide à mettre à jour (email et/ou classroom_role attendus)"}), 400
+
+    db.session.commit()
+    return jsonify({"ok": True, "updated": updated, "missing_fields": missing_profile_fields(user)})
+
+
+@app.route("/")
+def index():
+    return jsonify({"service": "Octix", "status": "en ligne"})
+
+@app.route("/debug", methods=["GET", "POST"])
+def debug():
+    return jsonify({
+        "method": request.method,
+        "args": request.args.to_dict(),
+        "form": request.form.to_dict(),
+        "json": request.get_json(silent=True, force=True),
+        "raw_data": request.get_data(as_text=True),
+        "content_type": request.content_type,
+        "content_length": request.content_length,
+    })
+
+
+# En local uniquement : sur Vercel, c'est api/index.py qui expose `app`,
+# et les tables doivent déjà exister (voir init_db.py) avant le déploiement.
 if __name__ == "__main__":
-    app.run(debug=True, port=5051)
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True, port=5050)
