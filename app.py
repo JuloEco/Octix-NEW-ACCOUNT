@@ -21,8 +21,6 @@ import secrets
 import requests
 from flask import Flask, render_template_string, request, flash, url_for
 from messages.envoi_message import envoyer_email_confirmation, envoyer_code_reinitialisation
-from compte_routes import compte_bp
-app.register_blueprint(compte_bp)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "octix_portal_secret")
@@ -30,6 +28,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "octix_portal_secret")
 OCTIX_URL = os.environ.get("OCTIX_URL", "http://localhost:5050")
 OCTIX_INTERNAL_KEY = os.environ.get("OCTIX_INTERNAL_KEY")
 
+from compte_routes import compte_bp
+app.register_blueprint(compte_bp)
 
 def _internal_headers():
     """Header attendu par octix.py sur /user/<username>/email et
