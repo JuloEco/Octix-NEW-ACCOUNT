@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "ecorcheville.jules@gmail.com"
+SENDER_EMAIL = "octix.org@gmail.com"
 APP_PASSWORD = os.environ["MDP"]
 
 HUB_URL = "https://omni-lbhc.onrender.com"
