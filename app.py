@@ -486,17 +486,19 @@ def register():
             return render_template_string(PAGE, success=False, apps=APPS)
 
         # Inscription Octix réussie
+        # Inscription Octix réussie
         ok, error = octix_register(username, password, email, classroom_role)
         if not ok:
             flash(error)
             return render_template_string(PAGE, success=False, apps=APPS)
 
-        # Envoi de l'e-mail de confirmation avec suivi de retour
+        # --- LOG DE DÉBOGAGE IMPÉRATIF ---
+        print(f"--> DEBUT ENVOI EMAIL A {email}", flush=True)
+        
         succes_email, msg_email = envoyer_email_confirmation(email, username)
-        if not succes_email:
-            app.logger.error(f"[EMAIL] ÉCHEC pour {email} ({username}) -> {msg_email}")
-        else:
-            app.logger.info(f"[EMAIL] SUCCÈS pour {email} ({username})")
+        
+        print(f"--> RESULTAT EMAIL : succes={succes_email}, msg={msg_email}", flush=True)
+        # ----------------------------------
 
         return render_template_string(PAGE, success=True, username=username, apps=APPS)
 
