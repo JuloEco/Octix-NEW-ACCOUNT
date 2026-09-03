@@ -32,10 +32,6 @@ def _get_app_password() -> str:
 
 
 def envoyer_email_confirmation(destinataire: str, username: str) -> tuple[bool, str]:
-    """
-    Envoie l'e-mail de bienvenue à `destinataire`.
-    Retourne (True, "OK") en cas de succès, ou (False, "Message d'erreur") sans planter.
-    """
     app_password = _get_app_password()
     if not app_password:
         err = "Variable d'environnement 'MDP' manquante."
@@ -48,13 +44,13 @@ def envoyer_email_confirmation(destinataire: str, username: str) -> tuple[bool, 
         msg["From"] = SENDER_EMAIL
         msg["To"] = destinataire
 
-        # Fallback texte
+        # 1. Fallback texte brut obligatoire en premier
         msg.set_content(
-            f"Bienvenue {username} ! Ton compte Octix est prêt. "
+            f"Bienvenue {username} ! Ton compte Octix est prêt.\n"
             f"Accède à nos services ici : {HUB_URL}"
         )
 
-        # HTML
+        # 2. Lecture du template HTML
         html_path = BASE_DIR / "email_dark.html"
         if not html_path.exists():
             return False, f"Fichier {html_path.name} introuvable."
@@ -63,22 +59,25 @@ def envoyer_email_confirmation(destinataire: str, username: str) -> tuple[bool, 
             html = f.read()
         html = html.replace("{{USERNAME}}", username).replace("{{HUB_URL}}", HUB_URL)
         
-        # Récupération sécurisée de la partie HTML
-        html_part = msg.add_alternative(html, subtype="html")
+        # 3. Ajout de la version HTML alternative
+        msg.add_alternative(html, subtype="html")
 
-        # Images CID
+        # 4. Ajout des images liées (add_related sur msg.get_payload(1))
         logo_path = BASE_DIR / "octix.png"
         gif_path = BASE_DIR / "tick-dark-octix.gif"
 
-        if logo_path.exists():
+        # On cible le payload HTML (index 1)
+        html_part = msg.get_payload(1)
+
+        if logo_path.exists() and html_part:
             with open(logo_path, "rb") as f:
                 html_part.add_related(f.read(), maintype="image", subtype="png", cid="<octix_logo.png>")
 
-        if gif_path.exists():
+        if gif_path.exists() and html_part:
             with open(gif_path, "rb") as f:
                 html_part.add_related(f.read(), maintype="image", subtype="gif", cid="<tick_dark_icon>")
 
-        # Envoi SMTP
+        # 5. Envoi SMTP
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
             server.starttls()
             server.login(SENDER_EMAIL, app_password)
@@ -91,7 +90,6 @@ def envoyer_email_confirmation(destinataire: str, username: str) -> tuple[bool, 
         err_msg = f"Échec d'envoi e-mail confirmation: {e}"
         logger.error(f"[EMAIL] {err_msg}")
         return False, err_msg
-
 
 def envoyer_code_reinitialisation(destinataire: str, username: str, code: str) -> tuple[bool, str]:
     """
