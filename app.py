@@ -485,17 +485,18 @@ def register():
             flash("Les deux mots de passe ne correspondent pas.")
             return render_template_string(PAGE, success=False, apps=APPS)
 
+        # Inscription Octix réussie
         ok, error = octix_register(username, password, email, classroom_role)
         if not ok:
             flash(error)
             return render_template_string(PAGE, success=False, apps=APPS)
 
-        # L'e-mail de bienvenue ne doit jamais faire échouer la création du
-        # compte : si Gmail est indisponible, on log et on continue quand même.
-        try:
-            envoyer_email_confirmation(email, username)
-        except Exception as e:
-            app.logger.warning(f"Échec de l'envoi de l'e-mail de confirmation à {email} : {e}")
+        # Envoi de l'e-mail de confirmation avec suivi de retour
+        succes_email, msg_email = envoyer_email_confirmation(email, username)
+        if not succes_email:
+            app.logger.error(f"[EMAIL] ÉCHEC pour {email} ({username}) -> {msg_email}")
+        else:
+            app.logger.info(f"[EMAIL] SUCCÈS pour {email} ({username})")
 
         return render_template_string(PAGE, success=True, username=username, apps=APPS)
 
