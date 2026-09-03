@@ -31,65 +31,20 @@ def _get_app_password() -> str:
     return raw_mdp.replace(" ", "").strip()
 
 
-def envoyer_email_confirmation(destinataire: str, username: str) -> tuple[bool, str]:
-    app_password = _get_app_password()
-    if not app_password:
-        err = "Variable d'environnement 'MDP' manquante."
-        logger.error(f"[EMAIL] {err}")
-        return False, err
+# Inscription Octix réussie
+        ok, error = octix_register(username, password, email, classroom_role)
+        if not ok:
+            flash(error)
+            return render_template_string(PAGE, success=False, apps=APPS)
 
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = "Ton compte Octix a été créé avec succès !"
-        msg["From"] = SENDER_EMAIL
-        msg["To"] = destinataire
+        # Envoi de l'e-mail de confirmation avec suivi de retour
+        succes_email, msg_email = envoyer_email_confirmation(email, username)
+        if not succes_email:
+            app.logger.error(f"[EMAIL] ÉCHEC pour {email} ({username}) -> {msg_email}")
+        else:
+            app.logger.info(f"[EMAIL] SUCCÈS pour {email} ({username})")
 
-        # 1. Fallback texte brut obligatoire en premier
-        msg.set_content(
-            f"Bienvenue {username} ! Ton compte Octix est prêt.\n"
-            f"Accède à nos services ici : {HUB_URL}"
-        )
-
-        # 2. Lecture du template HTML
-        html_path = BASE_DIR / "email_dark.html"
-        if not html_path.exists():
-            return False, f"Fichier {html_path.name} introuvable."
-
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
-        html = html.replace("{{USERNAME}}", username).replace("{{HUB_URL}}", HUB_URL)
-        
-        # 3. Ajout de la version HTML alternative
-        msg.add_alternative(html, subtype="html")
-
-        # 4. Ajout des images liées (add_related sur msg.get_payload(1))
-        logo_path = BASE_DIR / "octix.png"
-        gif_path = BASE_DIR / "tick-dark-octix.gif"
-
-        # On cible le payload HTML (index 1)
-        html_part = msg.get_payload(1)
-
-        if logo_path.exists() and html_part:
-            with open(logo_path, "rb") as f:
-                html_part.add_related(f.read(), maintype="image", subtype="png", cid="<octix_logo.png>")
-
-        if gif_path.exists() and html_part:
-            with open(gif_path, "rb") as f:
-                html_part.add_related(f.read(), maintype="image", subtype="gif", cid="<tick_dark_icon>")
-
-        # 5. Envoi SMTP
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
-            server.starttls()
-            server.login(SENDER_EMAIL, app_password)
-            server.send_message(msg)
-
-        logger.info(f"[EMAIL] E-mail de confirmation envoyé à {destinataire}")
-        return True, "E-mail envoyé avec succès"
-
-    except Exception as e:
-        err_msg = f"Échec d'envoi e-mail confirmation: {e}"
-        logger.error(f"[EMAIL] {err_msg}")
-        return False, err_msg
+        return render_template_string(PAGE, success=True, username=username, apps=APPS)
 
 def envoyer_code_reinitialisation(destinataire: str, username: str, code: str) -> tuple[bool, str]:
     """
