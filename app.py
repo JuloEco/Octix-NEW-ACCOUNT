@@ -62,45 +62,34 @@ def octix_register(username, password, email, classroom_role):
             r.text[:500]
         )
 
-        if r.status_code == 201:
+        # 1. Succès (200 OK ou 201 Created)
+        if r.status_code in (200, 201):
             return True, None
 
+        # 2. Cas spécifique : Utilisateur / Mail déjà existant
+        if r.status_code == 409:
+            return False, "Ce nom d'utilisateur ou cet e-mail est déjà utilisé."
+
+        # 3. Autres erreurs renvoyées par l'API
         try:
             data = r.json()
-            error = data.get(
-                "error",
-                f"Erreur Octix HTTP {r.status_code}"
-            )
-        except ValueError:
+            # Cherche 'error', 'message' ou 'detail'
+            error = data.get("error") or data.get("message") or data.get("detail") or f"Erreur Octix HTTP {r.status_code}"
+        except Exception:
             error = f"Erreur Octix HTTP {r.status_code}: {r.text[:200]}"
 
         return False, error
 
     except requests.exceptions.Timeout as e:
-        app.logger.error(
-            "Timeout vers Octix API (%s/register): %r",
-            OCTIX_URL,
-            e,
-        )
-        return False, (
-            "Octix met trop de temps à répondre. "
-            "Réessaie dans quelques secondes."
-        )
+        app.logger.error("Timeout vers Octix API (%s/register): %r", OCTIX_URL, e)
+        return False, "Octix met trop de temps à répondre. Réessaie dans quelques secondes."
 
     except requests.exceptions.ConnectionError as e:
-        app.logger.error(
-            "Erreur de connexion vers Octix API (%s/register): %r",
-            OCTIX_URL,
-            e,
-        )
+        app.logger.error("Erreur de connexion vers Octix API (%s/register): %r", OCTIX_URL, e)
         return False, "Impossible de joindre le serveur Octix."
 
     except requests.exceptions.RequestException as e:
-        app.logger.exception(
-            "Erreur HTTP vers Octix API (%s/register): %r",
-            OCTIX_URL,
-            e,
-        )
+        app.logger.exception("Erreur HTTP vers Octix API (%s/register): %r", OCTIX_URL, e)
         return False, "Une erreur de communication avec Octix est survenue."
 
 
