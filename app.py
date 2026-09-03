@@ -47,14 +47,61 @@ def octix_register(username, password, email, classroom_role):
     try:
         r = requests.post(
             f"{OCTIX_URL}/register",
-            json={"username": username, "password": password, "email": email, "classroom_role": classroom_role},
-            timeout=5,
+            json={
+                "username": username,
+                "password": password,
+                "email": email,
+                "classroom_role": classroom_role,
+            },
+            timeout=15,
         )
+
+        app.logger.info(
+            "Octix /register -> HTTP %s : %s",
+            r.status_code,
+            r.text[:500]
+        )
+
         if r.status_code == 201:
             return True, None
-        return False, r.json().get("error", "Erreur inconnue lors de la création du compte.")
-    except requests.exceptions.RequestException:
-        return False, "Octix est injoignable pour le moment. Réessaie dans un instant."
+
+        try:
+            data = r.json()
+            error = data.get(
+                "error",
+                f"Erreur Octix HTTP {r.status_code}"
+            )
+        except ValueError:
+            error = f"Erreur Octix HTTP {r.status_code}: {r.text[:200]}"
+
+        return False, error
+
+    except requests.exceptions.Timeout as e:
+        app.logger.error(
+            "Timeout vers Octix API (%s/register): %r",
+            OCTIX_URL,
+            e,
+        )
+        return False, (
+            "Octix met trop de temps à répondre. "
+            "Réessaie dans quelques secondes."
+        )
+
+    except requests.exceptions.ConnectionError as e:
+        app.logger.error(
+            "Erreur de connexion vers Octix API (%s/register): %r",
+            OCTIX_URL,
+            e,
+        )
+        return False, "Impossible de joindre le serveur Octix."
+
+    except requests.exceptions.RequestException as e:
+        app.logger.exception(
+            "Erreur HTTP vers Octix API (%s/register): %r",
+            OCTIX_URL,
+            e,
+        )
+        return False, "Une erreur de communication avec Octix est survenue."
 
 
 def octix_get_email(username):
